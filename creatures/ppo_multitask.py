@@ -1,7 +1,8 @@
-from typing import Optional, Generator, Dict
+from typing import Optional, Generator, Dict, List
+from torchtyping import TensorType
 import time
 
-import gymnasium
+import gym
 import torch
 from torch.utils.data.dataloader import default_collate
 import numpy as np
@@ -16,23 +17,24 @@ class Model(torch.nn.Module):
     def __init__(self, num_actions):
         super().__init__()
         self.num_actions = num_actions
-        #self.v = torch.nn.Linear(in_features=4,out_features=1)
-        #self.pi = torch.nn.Linear(in_features=4,out_features=num_actions)
-        self.v = torch.nn.Sequential(
-            torch.nn.Linear(in_features=4,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=1),
+        self.conv = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                in_channels=4,out_channels=32,kernel_size=8,stride=4),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(
+                in_channels=32,out_channels=64,kernel_size=4,stride=2),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(
+                in_channels=64,out_channels=64,kernel_size=3,stride=1),
+            torch.nn.ReLU(),
+            torch.nn.Flatten(),
+            torch.nn.Linear(in_features=64*7*7,out_features=512),
+            torch.nn.ReLU(),
         )
-        self.pi = torch.nn.Sequential(
-            torch.nn.Linear(in_features=4,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=num_actions),
-        )
+        self.v = torch.nn.Linear(in_features=512,out_features=1)
+        self.pi = torch.nn.Linear(in_features=512,out_features=num_actions)
     def forward(self, x):
+        x = self.conv(x)
         v = self.v(x)
         pi = self.pi(x)
         return {
@@ -58,8 +60,8 @@ def enum_minibatches(batch_size, minibatch_size, num_minibatches, replace=False)
 
 
 def compute_ppo_losses(
-        observation_space : gymnasium.Space,
-        action_space : gymnasium.Space,
+        observation_space : gym.Space,
+        action_space : gym.Space,
         history : VecHistoryBuffer,
         model : torch.nn.Module,
         discount : float,
@@ -70,7 +72,7 @@ def compute_ppo_losses(
         vf_loss_coeff : float,
         target_kl : Optional[float],
         minibatch_size : int,
-        num_minibatches : int) -> Generator[Dict[str,torch.Tensor],None,None]:
+        num_minibatches : int) -> Generator[Dict[str,TensorType],None,None]:
     """
     Compute the losses for PPO.
     """
@@ -180,9 +182,10 @@ def compute_ppo_losses(
                 break
 
 
-def train_ppo_cartpole(
+def train_ppo_atari(
         model: torch.nn.Module,
-        env: gymnasium.vector.VectorEnv,
+        env: gym.vector.VectorEnv,
+        env_labels: List[str],
         optimizer: torch.optim.Optimizer,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler], # XXX: Private class. This might break in the future.
         *,
@@ -219,7 +222,7 @@ def train_ppo_cartpole(
             device=device)
     start_time = time.time()
 
-    obs, info = env.reset()
+    obs = env.reset()
     history.append_obs(obs)
     episode_reward = np.zeros(num_envs)
     episode_steps = np.zeros(num_envs)
@@ -236,8 +239,7 @@ def train_ppo_cartpole(
                 action = action_dist.sample().cpu().numpy()
 
             # Step environment
-            obs, reward, terminated, truncated, info = env.step(action) # type: ignore
-            done = terminated | truncated
+            obs, reward, done, info = env.step(action)
 
             history.append_action(action)
             episode_reward += reward
@@ -282,7 +284,7 @@ def train_ppo_cartpole(
             optimizer.zero_grad()
             x['loss'].backward()
             if max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm) # type: ignore
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
             wandb.log({
@@ -320,39 +322,45 @@ def train_ppo_cartpole(
 
 if __name__ == '__main__':
     import argparse
+    from gym.wrappers import AtariPreprocessing, FrameStack
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--env', type=str, default='CartPole-v1', help='Environment to train on')
-    parser.add_argument('--num-envs', type=int, default=8, help='Number of environments to train on')
-    parser.add_argument('--max-steps', type=int, default=200_000//8//32, help='Number of training steps to run. One step is one weight update.')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
-    parser.add_argument('--rollout-length', type=int, default=32, help='Length of rollout.')
+    parser.add_argument('--env', type=str, default=['PongNoFrameskip-v4'], nargs='*', help='Environments to train on')
+    parser.add_argument('--num-envs', type=int, default=[8], nargs='*',
+            help='Number of environments to train on. If a single number is specified, it will be used for all environments. If a list of numbers is specified, it must have the same length as --env.')
+    parser.add_argument('--env-labels', type=str, default=None, nargs='*',
+            help='')
+    parser.add_argument('--max-steps', type=int, default=10_000_000//8//128, help='Number of training steps to run. One step is one weight update.')
+    parser.add_argument('--lr', type=float, default=2.5e-4, help='Learning rate.')
+    parser.add_argument('--rollout-length', type=int, default=128, help='Length of rollout.')
     parser.add_argument('--reward-clip', type=float, default=None, help='Clip the reward magnitude to this value.')
     parser.add_argument('--reward-scale', type=float, default=1, help='Scale the reward magnitude by this value.')
-    parser.add_argument('--discount', type=float, default=0.98, help='Discount factor.')
-    parser.add_argument('--gae-lambda', type=float, default=0.8, help='Lambda for GAE.')
+    parser.add_argument('--discount', type=float, default=0.99, help='Discount factor.')
+    parser.add_argument('--gae-lambda', type=float, default=0.95, help='Lambda for GAE.')
     parser.add_argument('--norm-adv', type=bool, default=True, help='Normalize the advantages.')
-    parser.add_argument('--clip-vf-loss', type=bool, default=False, help='Clip the value function loss.')
+    parser.add_argument('--clip-vf-loss', type=bool, default=True, help='Clip the value function loss.')
     parser.add_argument('--vf-loss-coeff', type=float, default=0.5, help='Coefficient for the value function loss.')
-    parser.add_argument('--entropy-loss-coeff', type=float, default=0.00, help='Coefficient for the entropy loss.')
+    parser.add_argument('--entropy-loss-coeff', type=float, default=0.01, help='Coefficient for the entropy loss.')
     parser.add_argument('--target-kl', type=float, default=0.01, help='Target KL divergence.')
     parser.add_argument('--minibatch-size', type=int, default=256, help='Minibatch size.')
-    parser.add_argument('--num-minibatches', type=int, default=20, help='Number of minibatches.')
-    parser.add_argument('--max-grad-norm', type=float, default=0.5, help='Maximum gradient norm.')
+    parser.add_argument('--num-minibatches', type=int, default=4, help='Number of minibatches.')
+    parser.add_argument('--max-grad-norm', type=float, default=None, help='Maximum gradient norm.')
 
     parser.add_argument('--cuda', action='store_true', help='Use CUDA.')
 
     args = parser.parse_args()
 
-    wandb.init(project='ppo-cartpole')
+    wandb.init(project='ppo-atari')
     wandb.config.update(args)
 
     def make_env(name):
-        env = gymnasium.make(name)
+        env = gym.make(name)
+        env = AtariPreprocessing(env)
+        env = FrameStack(env, 4)
         return env
-    env = gymnasium.vector.AsyncVectorEnv([lambda: make_env(args.env) for _ in range(args.num_envs)])
-    assert isinstance(env.single_action_space, gymnasium.spaces.Discrete)
+    env = gym.vector.AsyncVectorEnv([lambda: make_env(args.env) for _ in range(args.num_envs)])
+    env_labels = args.env_labels if args.env_labels is not None else args.env
 
     if args.cuda and torch.cuda.is_available():
         device = torch.device('cuda')
@@ -363,11 +371,11 @@ if __name__ == '__main__':
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     lr_scheduler = None
-    #lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, 1.0, 0.0, total_iters=args.max_steps//2)
 
-    trainer = train_ppo_cartpole(
+    trainer = train_ppo_atari(
             model = model,
             env = env,
+            env_labels = env_labels,
             optimizer = optimizer,
             lr_scheduler = lr_scheduler,
             max_steps = args.max_steps,
