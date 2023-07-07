@@ -1,4 +1,4 @@
-from typing import Optional, Generator, Dict
+from typing import Optional, Generator, Dict, Union, Tuple
 import time
 
 import gymnasium
@@ -13,53 +13,62 @@ from frankenstein.loss.policy_gradient import clipped_advantage_policy_gradient_
 
 
 class Model(torch.nn.Module):
-    def __init__(self, input_size, num_actions):
+    def __init__(self, num_actions):
         super().__init__()
         self.num_actions = num_actions
-        #self.v = torch.nn.Linear(in_features=4,out_features=1)
-        #self.pi = torch.nn.Linear(in_features=4,out_features=num_actions)
-        self.v = torch.nn.Sequential(
-            torch.nn.Linear(in_features=input_size,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=1),
+        self.conv = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                in_channels=1,out_channels=32,kernel_size=8,stride=4),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(
+                in_channels=32,out_channels=64,kernel_size=4,stride=2),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(
+                in_channels=64,out_channels=64,kernel_size=3,stride=1),
+            torch.nn.ReLU(),
+            torch.nn.Flatten(),
         )
-        self.pi = torch.nn.Sequential(
-            torch.nn.Linear(in_features=input_size,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(in_features=64,out_features=num_actions),
-        )
-    def forward(self, x):
+        self.lstm = torch.nn.LSTMCell(input_size=64*7*7,hidden_size=512)
+        self.v = torch.nn.Linear(in_features=512,out_features=1)
+        self.pi = torch.nn.Linear(in_features=512,out_features=num_actions)
+        #self.conv = torch.nn.Sequential(
+        #    torch.nn.Conv2d(
+        #        in_channels=1,out_channels=32,kernel_size=8,stride=4),
+        #    torch.nn.ReLU(),
+        #    torch.nn.Conv2d(
+        #        in_channels=32,out_channels=64,kernel_size=4,stride=2),
+        #    torch.nn.ReLU(),
+        #    torch.nn.Conv2d(
+        #        in_channels=64,out_channels=64,kernel_size=3,stride=1),
+        #    torch.nn.ReLU(),
+        #    torch.nn.Flatten(),
+        #    torch.nn.Linear(in_features=64*7*7,out_features=512),
+        #    torch.nn.ReLU(),
+        #)
+        #self.lstm = torch.nn.LSTMCell(input_size=512,hidden_size=128)
+        #self.v = torch.nn.Linear(in_features=128,out_features=1)
+        #self.pi = torch.nn.Linear(in_features=128,out_features=num_actions)
+    def forward(self, x, hidden):
+        x = self.conv(x)
+        h, c = self.lstm(x, hidden)
+        x = torch.relu(h)
         v = self.v(x)
         pi = self.pi(x)
         return {
                 'value': v,
                 'action': pi, # Unnormalized action probabilities
+                'hidden': (h, c),
         }
-
-
-def enum_minibatches(batch_size, minibatch_size, num_minibatches, replace=False):
-    indices = np.arange(batch_size)
-    if replace:
-        for _ in range(0,batch_size,minibatch_size):
-            np.random.shuffle(indices)
-            yield indices[:minibatch_size]
-    else:
-        indices = np.arange(batch_size)
-        n = batch_size//minibatch_size
-        for i in range(num_minibatches):
-            j = i % n
-            if j == 0:
-                np.random.shuffle(indices)
-            yield indices[j*minibatch_size:(j+1)*minibatch_size]
+    def init_hidden(self, batch_size):
+        hidden_size = self.lstm.hidden_size
+        device = next(self.parameters()).device
+        return (
+                torch.zeros([batch_size, hidden_size], device=device),
+                torch.zeros([batch_size, hidden_size], device=device),
+        )
 
 
 def compute_ppo_losses(
-        observation_space : gymnasium.Space,
-        action_space : gymnasium.Space,
         history : VecHistoryBuffer,
         model : torch.nn.Module,
         discount : float,
@@ -69,8 +78,7 @@ def compute_ppo_losses(
         entropy_loss_coeff : float,
         vf_loss_coeff : float,
         target_kl : Optional[float],
-        minibatch_size : int,
-        num_minibatches : int) -> Generator[Dict[str,torch.Tensor],None,None]:
+        num_epochs : int) -> Generator[Dict,None,None]:
     """
     Compute the losses for PPO.
     """
@@ -78,12 +86,26 @@ def compute_ppo_losses(
     action = history.action
     reward = history.reward
     terminal = history.terminal
+    misc = history.misc
+    assert isinstance(misc,dict)
+    hidden = misc['hidden']
 
     n = len(history.obs_history)
-    num_training_envs = len(history.obs_history[0])
+    num_training_envs = len(reward[0])
+    initial_hidden = model.init_hidden(num_training_envs) # type: ignore
 
     with torch.no_grad():
-        net_output = default_collate([model(torch.tensor(o, dtype=torch.float, device=device)) for o in obs])
+        net_output = []
+        curr_hidden = tuple([h[0].detach() for h in hidden])
+        for o,term in zip(obs,terminal):
+            curr_hidden = tuple([
+                torch.where(term.unsqueeze(1), init_h, h)
+                for init_h,h in zip(initial_hidden,curr_hidden)
+            ])
+            no = model(o/255.,curr_hidden)
+            curr_hidden = no['hidden']
+            net_output.append(no)
+        net_output = default_collate(net_output)
         state_values_old = net_output['value'].squeeze(2)
         action_dist = torch.distributions.Categorical(logits=net_output['action'][:n-1])
         log_action_probs_old = action_dist.log_prob(action)
@@ -99,70 +121,59 @@ def compute_ppo_losses(
         )
         returns = advantages + state_values_old[:n-1,:]
 
-    # Flatten everything
-    flat_obs = obs[:n-1].reshape(-1,*observation_space.shape)
-    flat_action = action[:n-1].reshape(-1, *action_space.shape)
-    flat_terminals = terminal[:n-1].reshape(-1)
-    flat_returns = returns[:n-1].reshape(-1)
-    flat_advantages = advantages[:n-1].reshape(-1)
-    flat_log_action_probs_old = log_action_probs_old[:n-1].reshape(-1)
-    flat_state_values_old = state_values_old[:n-1].reshape(-1)
+        if norm_adv:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    minibatches = enum_minibatches(
-            batch_size=(n-1) * num_training_envs,
-            minibatch_size=minibatch_size,
-            num_minibatches=num_minibatches,
-            replace=False)
+    for _ in range(num_epochs):
+        net_output = []
+        curr_hidden = tuple([h[0].detach() for h in hidden])
+        initial_hidden = model.init_hidden(num_training_envs) # type: ignore
+        for o,term in zip(obs,terminal):
+            curr_hidden = tuple([
+                torch.where(term.unsqueeze(1), init_h, h)
+                for init_h,h in zip(initial_hidden,curr_hidden)
+            ])
+            no = model(o/255.,curr_hidden)
+            curr_hidden = no['hidden']
+            net_output.append(no)
+        net_output = default_collate(net_output)
 
-    for _,mb_inds in enumerate(minibatches):
-        mb_obs = torch.tensor(flat_obs[mb_inds], dtype=torch.float, device=device)
-        mb_action = flat_action[mb_inds]
-        mb_returns = flat_returns[mb_inds]
-        mb_advantages = flat_advantages[mb_inds]
-        mb_terminals = flat_terminals[mb_inds]
-        mb_log_action_probs_old = flat_log_action_probs_old[mb_inds]
-        mb_state_values_old = flat_state_values_old[mb_inds]
-
-        net_output = model(mb_obs)
         assert 'value' in net_output
         assert 'action' in net_output
-        mb_state_values = net_output['value'].squeeze()
-        action_dist = torch.distributions.Categorical(logits=net_output['action'])
-        mb_log_action_probs = action_dist.log_prob(mb_action)
-        mb_entropy = action_dist.entropy()
+        state_values = net_output['value'].squeeze()
+        action_dist = torch.distributions.Categorical(logits=net_output['action'][:n-1])
+        log_action_probs = action_dist.log_prob(action)
+        entropy = action_dist.entropy()
 
         with torch.no_grad():
-            logratio = mb_log_action_probs - mb_log_action_probs_old
+            logratio = log_action_probs - log_action_probs_old
             ratio = logratio.exp()
             approx_kl = ((ratio - 1) - logratio).mean()
 
-        if norm_adv:
-            mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
         # Policy loss
         pg_loss = clipped_advantage_policy_gradient_loss(
-                log_action_probs = mb_log_action_probs,
-                old_log_action_probs = mb_log_action_probs_old,
-                advantages = mb_advantages,
-                terminals = mb_terminals,
+                log_action_probs = log_action_probs,
+                old_log_action_probs = log_action_probs_old,
+                advantages = advantages,
+                terminals = terminal[:n-1],
                 epsilon=0.1
         ).mean()
 
         # Value loss
         if clip_vf_loss is not None:
-            v_loss_unclipped = (mb_state_values - mb_returns) ** 2
-            v_clipped = mb_state_values_old + torch.clamp(
-                mb_state_values - mb_state_values_old,
+            v_loss_unclipped = (state_values[:n-1] - returns) ** 2
+            v_clipped = state_values_old[:n-1] + torch.clamp(
+                state_values[:n-1] - state_values_old[:n-1],
                 -clip_vf_loss,
                 clip_vf_loss,
             )
-            v_loss_clipped = (v_clipped - mb_returns) ** 2
+            v_loss_clipped = (v_clipped - returns) ** 2
             v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
             v_loss = 0.5 * v_loss_max.mean()
         else:
-            v_loss = 0.5 * ((mb_state_values - mb_returns) ** 2).mean()
+            v_loss = 0.5 * ((state_values[:n-1] - returns) ** 2).mean()
 
-        entropy_loss = mb_entropy.mean()
+        entropy_loss = entropy.mean()
         loss = pg_loss - entropy_loss_coeff * entropy_loss + v_loss * vf_loss_coeff
 
         yield {
@@ -171,8 +182,10 @@ def compute_ppo_losses(
                 'loss_vf': v_loss,
                 'loss_entropy': -entropy_loss,
                 'approx_kl': approx_kl,
-                'state_value': mb_state_values,
-                'entropy': mb_entropy,
+                'state_value': state_values,
+                'entropy': entropy,
+                'output': net_output,
+                'hidden': tuple(h.detach() for h in curr_hidden),
         }
 
         if target_kl is not None:
@@ -180,7 +193,7 @@ def compute_ppo_losses(
                 break
 
 
-def train_ppo_cartpole(
+def train_ppo_atari(
         model: torch.nn.Module,
         env: gymnasium.vector.VectorEnv,
         optimizer: torch.optim.Optimizer,
@@ -196,10 +209,10 @@ def train_ppo_cartpole(
         clip_vf_loss: Optional[float] = None,
         entropy_loss_coeff: float = 0.01,
         vf_loss_coeff: float = 0.5,
-        num_minibatches: int = 4,
-        minibatch_size: int = 32,
+        num_epochs: int = 4,
         target_kl: Optional[float] = None,
         norm_adv: bool = True,
+        update_hidden_after_grad: bool = False,
         ):
     """
     Train a model with PPO on an Atari game.
@@ -210,8 +223,6 @@ def train_ppo_cartpole(
     """
     num_envs = env.num_envs
     device = next(model.parameters()).device
-    observation_space = env.single_observation_space
-    action_space = env.single_action_space
 
     history = VecHistoryBuffer(
             num_envs = num_envs,
@@ -220,7 +231,8 @@ def train_ppo_cartpole(
     start_time = time.time()
 
     obs, info = env.reset()
-    history.append_obs(obs)
+    hidden = model.init_hidden(num_envs) # type: ignore
+    history.append_obs(obs, misc={'hidden': hidden})
     episode_reward = np.zeros(num_envs)
     episode_steps = np.zeros(num_envs)
     env_steps = 0
@@ -231,7 +243,10 @@ def train_ppo_cartpole(
 
             # Select action
             with torch.no_grad():
-                action_probs = model(torch.tensor(obs, dtype=torch.float, device=device))['action'].softmax(1)
+                model_output = model(torch.tensor(obs, dtype=torch.float, device=device)/255.0, hidden)
+                hidden = model_output['hidden']
+
+                action_probs = model_output['action'].softmax(1)
                 action_dist = torch.distributions.Categorical(action_probs)
                 action = action_dist.sample().cpu().numpy()
 
@@ -247,11 +262,11 @@ def train_ppo_cartpole(
             if reward_clip is not None:
                 reward = np.clip(reward, -reward_clip, reward_clip)
 
-            history.append_obs(obs, reward, done)
+            history.append_obs(obs, reward, done, misc={'hidden': hidden})
 
-            if done.any():
-                if 'lives' in info:
-                    done = info['lives'] == 0
+            #if done.any():
+            #    if 'lives' in info:
+            #        done &= info['lives'] == 0
             if done.any():
                 print(f'{step * num_envs * rollout_length:,}\t reward: {episode_reward[done].mean():.2f}\t len: {episode_steps[done].mean()}')
                 if wandb.run is not None:
@@ -262,11 +277,14 @@ def train_ppo_cartpole(
                     }, step = env_steps)
                 episode_reward[done] = 0
                 episode_steps[done] = 0
+                # Reset hidden state for finished episodes
+                hidden = tuple(
+                        torch.where(torch.tensor(done, device=device).unsqueeze(1), h0, h)
+                        for h0,h in zip(model.init_hidden(num_envs), hidden) # type: ignore (???)
+                )
 
         # Train
         losses = compute_ppo_losses(
-                observation_space = observation_space,
-                action_space = action_space,
                 history = history,
                 model = model,
                 discount = discount,
@@ -276,9 +294,9 @@ def train_ppo_cartpole(
                 vf_loss_coeff = vf_loss_coeff,
                 entropy_loss_coeff = entropy_loss_coeff,
                 target_kl = target_kl,
-                minibatch_size = minibatch_size,
-                num_minibatches = num_minibatches,
+                num_epochs = num_epochs,
         )
+        x = {}
         for i,x in enumerate(losses):
             optimizer.zero_grad()
             x['loss'].backward()
@@ -303,6 +321,11 @@ def train_ppo_cartpole(
         # Clear data
         history.clear()
 
+        if update_hidden_after_grad and 'hidden' in x:
+            # The hidden state is already reset appropriately in the `compute_ppo_losses` function, so no need to check again here.
+            history.misc_history[-1]['hidden'] = x['hidden']
+            hidden = x['hidden']
+
         # Update learning rate
         if lr_scheduler is not None:
             lr_scheduler.step()
@@ -322,60 +345,59 @@ def train_ppo_cartpole(
 
 if __name__ == '__main__':
     import argparse
+    from gymnasium.wrappers import AtariPreprocessing, FrameStack # type: ignore
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--env', type=str, default='CartPole-v1', help='Environment to train on')
+    parser.add_argument('--env', type=str, default='ALE/Pong-v5', help='Environment to train on')
     parser.add_argument('--num-envs', type=int, default=8, help='Number of environments to train on')
-    parser.add_argument('--max-steps', type=int, default=200_000//8//32, help='Number of training steps to run. One step is one weight update.')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
-    parser.add_argument('--rollout-length', type=int, default=32, help='Length of rollout.')
+    parser.add_argument('--full-action-space', action='store_true', help='Use full action space.')
+
+    parser.add_argument('--max-steps', type=int, default=10_000_000//8//128, help='Number of training steps to run. One step is one weight update.')
+    parser.add_argument('--lr', type=float, default=2.5e-4, help='Learning rate.')
+    parser.add_argument('--rollout-length', type=int, default=128, help='Length of rollout.')
     parser.add_argument('--reward-clip', type=float, default=None, help='Clip the reward magnitude to this value.')
     parser.add_argument('--reward-scale', type=float, default=1, help='Scale the reward magnitude by this value.')
-    parser.add_argument('--discount', type=float, default=0.98, help='Discount factor.')
-    parser.add_argument('--gae-lambda', type=float, default=0.8, help='Lambda for GAE.')
+    parser.add_argument('--discount', type=float, default=0.99, help='Discount factor.')
+    parser.add_argument('--gae-lambda', type=float, default=0.95, help='Lambda for GAE.')
     parser.add_argument('--norm-adv', type=bool, default=True, help='Normalize the advantages.')
-    parser.add_argument('--clip-vf-loss', type=bool, default=False, help='Clip the value function loss.')
+    parser.add_argument('--clip-vf-loss', type=float, default=0.1, help='Clip the value function loss.')
     parser.add_argument('--vf-loss-coeff', type=float, default=0.5, help='Coefficient for the value function loss.')
-    parser.add_argument('--entropy-loss-coeff', type=float, default=0.00, help='Coefficient for the entropy loss.')
+    parser.add_argument('--entropy-loss-coeff', type=float, default=0.01, help='Coefficient for the entropy loss.')
     parser.add_argument('--target-kl', type=float, default=0.01, help='Target KL divergence.')
-    parser.add_argument('--minibatch-size', type=int, default=256, help='Minibatch size.')
-    parser.add_argument('--num-minibatches', type=int, default=20, help='Number of minibatches.')
+    parser.add_argument('--num-epochs', type=int, default=5, help='Number of gradient steps per batch of rollouts.')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='Maximum gradient norm.')
+    parser.add_argument('--update-hidden-after-grad', action='store_true', help='[TODO]')
 
     parser.add_argument('--cuda', action='store_true', help='Use CUDA.')
-    parser.add_argument('--wandb', action='store_true', help='Use Weights and Biases.')
+    parser.add_argument('--wandb', action='store_true', help='Log data to Weights and Biases.')
 
     args = parser.parse_args()
 
     if args.wandb:
-        wandb.init(project='ppo-cartpole')
+        wandb.init(project='ppo-lstm-atari')
         wandb.config.update(args)
 
     def make_env(name):
-        env = gymnasium.make(name)
+        env = gymnasium.make(name, frameskip=1, full_action_space=args.full_action_space)
+        env = AtariPreprocessing(env)
+        env = FrameStack(env, 1)
         return env
     env = gymnasium.vector.AsyncVectorEnv([lambda: make_env(args.env) for _ in range(args.num_envs)])
-    assert isinstance(env.single_action_space, gymnasium.spaces.Discrete)
 
     if args.cuda and torch.cuda.is_available():
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
 
-    if not isinstance(env.single_observation_space, gymnasium.spaces.Box):
-        raise ValueError(f"The environment specified ({args.env}) does not have a Box observation space.")
-    if not isinstance(env.single_action_space, gymnasium.spaces.Discrete):
-        raise ValueError(f"The environment specified ({args.env}) does not have a Discrete action space.")
-
-    model = Model(input_size=env.single_observation_space.shape[0],
-                  num_actions=env.single_action_space.n)
+    assert isinstance(env.single_action_space, gymnasium.spaces.Discrete)
+    model = Model(num_actions=env.single_action_space.n)
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr)
     lr_scheduler = None
-    #lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, 1.0, 0.0, total_iters=args.max_steps//2)
 
-    trainer = train_ppo_cartpole(
+    trainer = train_ppo_atari(
             model = model,
             env = env,
             optimizer = optimizer,
@@ -391,9 +413,8 @@ if __name__ == '__main__':
             vf_loss_coeff = args.vf_loss_coeff,
             entropy_loss_coeff = args.entropy_loss_coeff,
             target_kl = args.target_kl,
-            minibatch_size = args.minibatch_size,
-            num_minibatches = args.num_minibatches,
             max_grad_norm = args.max_grad_norm,
+            update_hidden_after_grad = args.update_hidden_after_grad,
     )
     for _ in trainer:
         pass

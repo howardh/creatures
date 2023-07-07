@@ -1,8 +1,7 @@
 from typing import Optional, Generator, Dict
-from torchtyping import TensorType
 import time
 
-import gym
+import gymnasium
 import torch
 from torch.utils.data.dataloader import default_collate
 import numpy as np
@@ -60,8 +59,8 @@ def enum_minibatches(batch_size, minibatch_size, num_minibatches, replace=False)
 
 
 def compute_ppo_losses(
-        observation_space : gym.Space,
-        action_space : gym.Space,
+        observation_space : gymnasium.Space,
+        action_space : gymnasium.Space,
         history : VecHistoryBuffer,
         model : torch.nn.Module,
         discount : float,
@@ -72,7 +71,7 @@ def compute_ppo_losses(
         vf_loss_coeff : float,
         target_kl : Optional[float],
         minibatch_size : int,
-        num_minibatches : int) -> Generator[Dict[str,TensorType],None,None]:
+        num_minibatches : int) -> Generator[Dict[str,torch.Tensor],None,None]:
     """
     Compute the losses for PPO.
     """
@@ -184,7 +183,7 @@ def compute_ppo_losses(
 
 def train_ppo_atari(
         model: torch.nn.Module,
-        env: gym.vector.VectorEnv,
+        env: gymnasium.vector.VectorEnv,
         optimizer: torch.optim.Optimizer,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler], # XXX: Private class. This might break in the future.
         *,
@@ -221,7 +220,7 @@ def train_ppo_atari(
             device=device)
     start_time = time.time()
 
-    obs = env.reset()
+    obs, info = env.reset()
     history.append_obs(obs)
     episode_reward = np.zeros(num_envs)
     episode_steps = np.zeros(num_envs)
@@ -238,7 +237,8 @@ def train_ppo_atari(
                 action = action_dist.sample().cpu().numpy()
 
             # Step environment
-            obs, reward, done, info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action) # type: ignore
+            done = terminated | truncated
 
             history.append_action(action)
             episode_reward += reward
@@ -250,16 +250,17 @@ def train_ppo_atari(
 
             history.append_obs(obs, reward, done)
 
-            if done.any():
-                if 'lives' in info:
-                    done = info['lives'] == 0
+            #if done.any():
+            #    if 'lives' in info:
+            #        done &= info['lives'] == 0
             if done.any():
                 print(f'{step * num_envs * rollout_length:,}\t reward: {episode_reward[done].mean():.2f}\t len: {episode_steps[done].mean()}')
-                wandb.log({
-                        'reward': episode_reward[done].mean().item(),
-                        'episode_length': episode_steps[done].mean().item(),
-                        'step': env_steps,
-                }, step = env_steps)
+                if wandb.run is not None:
+                    wandb.log({
+                            'reward': episode_reward[done].mean().item(),
+                            'episode_length': episode_steps[done].mean().item(),
+                            'step': env_steps,
+                    }, step = env_steps)
                 episode_reward[done] = 0
                 episode_steps[done] = 0
 
@@ -283,21 +284,22 @@ def train_ppo_atari(
             optimizer.zero_grad()
             x['loss'].backward()
             if max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm) # type: ignore
             optimizer.step()
 
-            wandb.log({
-                f'loss/pi/{i}': x['loss_pi'].item(),
-                f'loss/v/{i}': x['loss_vf'].item(),
-                f'loss/entropy/{i}': x['loss_entropy'].item(),
-                f'loss/total/{i}': x['loss'].item(),
-                f'approx_kl/{i}': x['approx_kl'].item(),
-                f'state_value/{i}': x['state_value'].mean().item(),
-                f'entropy/{i}': x['entropy'].mean().item(),
-                #last_approx_kl=approx_kl.item(),
-                #'learning_rate': lr_scheduler.get_lr()[0],
-                'step': env_steps,
-            }, step = env_steps)
+            if wandb.run is not None:
+                wandb.log({
+                    f'loss/pi/{i}': x['loss_pi'].item(),
+                    f'loss/v/{i}': x['loss_vf'].item(),
+                    f'loss/entropy/{i}': x['loss_entropy'].item(),
+                    f'loss/total/{i}': x['loss'].item(),
+                    f'approx_kl/{i}': x['approx_kl'].item(),
+                    f'state_value/{i}': x['state_value'].mean().item(),
+                    f'entropy/{i}': x['entropy'].mean().item(),
+                    #last_approx_kl=approx_kl.item(),
+                    #'learning_rate': lr_scheduler.get_lr()[0],
+                    'step': env_steps,
+                }, step = env_steps)
 
         # Clear data
         history.clear()
@@ -321,11 +323,11 @@ def train_ppo_atari(
 
 if __name__ == '__main__':
     import argparse
-    from gym.wrappers import AtariPreprocessing, FrameStack
+    from gymnasium.wrappers import AtariPreprocessing, FrameStack # type: ignore
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--env', type=str, default='PongNoFrameskip-v4', help='Environment to train on')
+    parser.add_argument('--env', type=str, default='ALE/Pong-v5', help='Environment to train on')
     parser.add_argument('--num-envs', type=int, default=8, help='Number of environments to train on')
     parser.add_argument('--max-steps', type=int, default=10_000_000//8//128, help='Number of training steps to run. One step is one weight update.')
     parser.add_argument('--lr', type=float, default=2.5e-4, help='Learning rate.')
@@ -344,24 +346,27 @@ if __name__ == '__main__':
     parser.add_argument('--max-grad-norm', type=float, default=None, help='Maximum gradient norm.')
 
     parser.add_argument('--cuda', action='store_true', help='Use CUDA.')
+    parser.add_argument('--wandb', action='store_true', help='Log data to Weights and Biases.')
 
     args = parser.parse_args()
 
-    wandb.init(project='ppo-atari')
-    wandb.config.update(args)
+    if args.wandb:
+        wandb.init(project='ppo-atari')
+        wandb.config.update(args)
 
     def make_env(name):
-        env = gym.make(name)
+        env = gymnasium.make(name, frameskip=1)
         env = AtariPreprocessing(env)
         env = FrameStack(env, 4)
         return env
-    env = gym.vector.AsyncVectorEnv([lambda: make_env(args.env) for _ in range(args.num_envs)])
+    env = gymnasium.vector.AsyncVectorEnv([lambda: make_env(args.env) for _ in range(args.num_envs)])
 
     if args.cuda and torch.cuda.is_available():
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
 
+    assert isinstance(env.single_action_space, gymnasium.spaces.Discrete)
     model = Model(num_actions=env.single_action_space.n)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
